@@ -1,4 +1,4 @@
-# GitHub Actions workflow: RDP with improved hardware verification handling for virtual runners
+# GitHub Actions workflow: RDP with hardware verification (fixed to avoid warnings on hosted runners)
 name: RDP
 
 on:
@@ -99,10 +99,20 @@ jobs:
           Start-Process msiexec.exe -ArgumentList "/i", "`"$installerPath`"", "/quiet", "/norestart" -Wait
           Remove-Item $installerPath -Force
 
-      - name: Verify GPU and Disk Specs (robust handling for virtual runners)
+      - name: Verify GPU and Disk Specs (robust handling for virtual/hosted runners)
         id: verify_hw
         shell: pwsh
         run: |
+          # Short-circuit: if this is a GitHub-hosted runner, skip strict hardware verification.
+          # GitHub-hosted windows-latest runners are virtual machines (Hyper-V / ephemeral disks),
+          # so checking for physical "RTX 20-series" and >=512GB will always fail there.
+          if ($env:GITHUB_ACTIONS -eq 'true' -and -not ($env:RUNNER_NAME -and $env:RUNNER_NAME -match 'self-hosted')) {
+            Write-Host "Detected GitHub-hosted runner (windows-latest). Skipping strict hardware verification."
+            Add-Content -Path $env:GITHUB_ENV -Value "HW_VERIFIED=skipped_github_hosted"
+            Add-Content -Path $env:GITHUB_ENV -Value "HW_VERIFIED_NOTE=Skipped strict verification because this is a GitHub-hosted runner (virtualized)."
+            exit 0
+          }
+
           $errors = @()
 
           # GPU detection: prefer nvidia-smi; fallback to PnP device friendly name
@@ -150,45 +160,11 @@ jobs:
             }
           }
 
-          # If there are errors, detect whether we're running in a virtual/ephemeral environment
           if ($errors.Count -gt 0) {
-            # Heuristics for virtual/hosted runners:
-            $isVirtual = $false
-
-            # Common virtual GPU names or markers
-            if ($gpuName -match 'Hyper-V' -or $gpuName -match 'Microsoft' -or $gpuName -match 'Virtual' -or $gpuName -match 'VMware' -or $gpuName -match 'VBox') {
-              $isVirtual = $true
-            }
-
-            # Check disk models / friendly names for virtual disks
-            if (-not $isVirtual) {
-              foreach ($d in $disks) {
-                $fn = ($d.FriendlyName + ' ' + ($d.Model -as [string])) -replace "`n"," "
-                if ($fn -match 'Virtual' -or $fn -match 'Msft' -or $fn -match 'VHD' -or $fn -match 'Ephemeral' -or $fn -match 'Virtual Disk') {
-                  $isVirtual = $true
-                  break
-                }
-              }
-            }
-
-            # Consider GitHub-hosted runners: GITHUB_ACTIONS=true often present (but could also be set in self-hosted)
-            $githubHosted = $false
-            if ($env:GITHUB_ACTIONS -eq 'true' -and -not ($env:RUNNER_NAME -and $env:RUNNER_NAME -match 'self-hosted')) {
-              $githubHosted = $true
-            }
-
-            if ($isVirtual -or $githubHosted) {
-              # Non-fatal: running in a virtual / hosted environment (common for windows-latest),
-              # record that strict hardware verification was skipped and continue.
-              $reason = ($errors -join ' ; ')
-              Write-Warning "Hardware verification detected differences but runner appears virtual/hosted. Skipping strict failure: $reason"
-              Add-Content -Path $env:GITHUB_ENV -Value "HW_VERIFIED=false"
-              Add-Content -Path $env:GITHUB_ENV -Value "HW_VERIFIED_NOTE=Skipped strict verification because virtual/hosted runner detected: $reason"
-            } else {
-              # Fatal: real machine that does not match expectations
-              Write-Error ($errors -join "`n")
-              exit 1
-            }
+            # If we reached here, we are not on a GitHub-hosted runner (short-circuit above),
+            # so treat this as a real host mismatch and fail.
+            Write-Error ($errors -join "`n")
+            exit 1
           } else {
             Write-Host "Hardware verification passed: GPU and disk match expectations."
             Add-Content -Path $env:GITHUB_ENV -Value "HW_VERIFIED=true"

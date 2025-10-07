@@ -1,0 +1,206 @@
+name: RDP
+
+on: workflow_dispatch:
+
+jobs: secure-rdp: runs-on: windows-latest timeout-minutes: 3600 env: TAILSCALE_AUTH_KEY: ${{ secrets.TAILSCALE_AUTH_KEY }}
+
+steps:
+  - name: Configure Core RDP Settings
+    shell: pwsh
+    run: |
+      # Enable Remote Desktop and keep Network Level Authentication enabled for security
+      Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' `
+        -Name "fDenyTSConnections" -Value 0 -Force
+
+      # Enable NLA (recommended). If you truly need NLA disabled, change value to 0 (risky).
+      Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
+        -Name "UserAuthentication" -Value 1 -Force
+
+      # Use negotiation security layer (default)
+      Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
+        -Name "SecurityLayer" -Value 0 -Force
+
+      # Remove any existing rule with the same name to avoid duplication
+      netsh advfirewall firewall delete rule name="RDP-Tailscale" || Write-Host "No existing rule to delete"
+
+      # Restrict inbound RDP to the Tailscale CGNAT range (only Tailscale peers can reach RDP)
+      netsh advfirewall firewall add rule name="RDP-Tailscale" `
+        dir=in action=allow protocol=TCP localport=3389 remoteip=100.64.0.0/10
+
+      # Restart RDP service to apply changes
+      Restart-Service -Name TermService -Force
+
+  - name: Create RDP User with Secure Password (write creds to temp file)
+    id: create_user
+    shell: pwsh
+    run: |
+      Add-Type -AssemblyName System.Security
+
+      $charSet = @{
+          Upper   = [char[]](65..90)
+          Lower   = [char[]](97..122)
+          Number  = [char[]](48..57)
+          Special = ([char[]](33..47) + [char[]](58..64) + [char[]](91..96) + [char[]](123..126))
+      }
+
+      $rawPassword = @()
+      $rawPassword += $charSet.Upper | Get-Random -Count 4
+      $rawPassword += $charSet.Lower | Get-Random -Count 4
+      $rawPassword += $charSet.Number | Get-Random -Count 4
+      $rawPassword += $charSet.Special | Get-Random -Count 4
+      $password = -join ($rawPassword | Sort-Object { Get-Random })
+
+      $securePass = ConvertTo-SecureString $password -AsPlainText -Force
+
+      # Create or update user
+      if (-not (Get-LocalUser -Name "Skyro" -ErrorAction SilentlyContinue)) {
+        New-LocalUser -Name "Skyro" -Password $securePass -AccountNeverExpires -Description "Temporary RDP user created by workflow"
+      } else {
+        Write-Host "User 'Skyro' already exists; updating password."
+        $user = Get-LocalUser -Name "Skyro"
+        $user | Set-LocalUser -Password $securePass
+      }
+
+      Add-LocalGroupMember -Group "Administrators" -Member "Skyro" -ErrorAction SilentlyContinue
+      Add-LocalGroupMember -Group "Remote Desktop Users" -Member "Skyro" -ErrorAction SilentlyContinue
+
+      # Write credentials to a temporary file in the runner's temp directory (not to logs)
+      $credPath = Join-Path $env:RUNNER_TEMP 'rdp-creds.txt'
+      "Username: Skyro`nPassword: $password`nCreatedAt: $(Get-Date -Format o)`nRunId: $env:GITHUB_RUN_ID" | Out-File -FilePath $credPath -Encoding UTF8 -Force
+
+      # Expose the file path to later steps (but NOT the password contents)
+      Add-Content -Path $env:GITHUB_ENV -Value "RDP_CREDS_FILE=$credPath"
+
+      if (-not (Get-LocalUser -Name "Skyro")) {
+        Write-Error "User creation failed"
+        exit 1
+      }
+
+  - name: Upload credentials as artifact (secure)
+    uses: actions/upload-artifact@v4
+    with:
+      name: rdp-creds-${{ github.run_id }}
+      path: ${{ env.RDP_CREDS_FILE }}
+
+  - name: Install Tailscale
+    shell: pwsh
+    run: |
+      $tsUrl = "https://pkgs.tailscale.com/stable/tailscale-setup-1.82.0-amd64.msi"
+      $installerPath = Join-Path $env:TEMP 'tailscale.msi'
+
+      Invoke-WebRequest -Uri $tsUrl -OutFile $installerPath
+      Start-Process msiexec.exe -ArgumentList "/i", "`"$installerPath`"", "/quiet", "/norestart" -Wait
+      Remove-Item $installerPath -Force
+
+  - name: Verify GPU and Disk Specs (ensure "RTX 20-series" and >=512GB SSD)
+    id: verify_hw
+    shell: pwsh
+    run: |
+      $errors = @()
+
+      # GPU detection: prefer nvidia-smi; fallback to PnP device friendly name
+      $gpuName = $null
+      if (Get-Command nvidia-smi -ErrorAction SilentlyContinue) {
+        $gpuName = (& nvidia-smi --query-gpu=name --format=csv,noheader 2>$null).Trim()
+      }
+      if (-not $gpuName) {
+        $gpuName = (Get-PnpDevice -Class Display -ErrorAction SilentlyContinue | Select-Object -First 1 -ExpandProperty FriendlyName)
+      }
+      $gpuName = $gpuName -replace "`n"," " -replace "`r"," " -replace ","," "
+
+      Write-Host "Detected GPU: $gpuName"
+
+      # Accept common RTX 20-series model names (e.g., RTX 2060, 2070, 2080, Quadro/RTX variants)
+      $isRtx20Series = $false
+      if ($gpuName) {
+        if ($gpuName -match 'RTX\s*20' -or $gpuName -match 'RTX\s*(2060|2070|2080|2080 Ti|2060 Super|2070 Super)') {
+          $isRtx20Series = $true
+        }
+      }
+
+      if (-not $isRtx20Series) {
+        $errors += "GPU does not appear to be an RTX 20-series card. Detected: '$gpuName'. Listing output for inspection."
+        # Capture some diagnostic output
+        if (Get-Command nvidia-smi -ErrorAction SilentlyContinue) {
+          & nvidia-smi --query-gpu=name,driver_version,memory.total --format=csv 2>$null | ForEach-Object { Write-Host "nvidia-smi: $_" }
+        } else {
+          Get-PnpDevice -Class Display | ForEach-Object { Write-Host "PnP Device: $($_.FriendlyName) [$($_.InstanceId)]" }
+        }
+      }
+
+      # Disk detection: look for any disk with size >= 512 GiB
+      $minSize = 512 * 1024 * 1024 * 1024
+      $bigDisk = Get-Disk -ErrorAction SilentlyContinue | Where-Object { $_.Size -ge $minSize } | Select-Object -First 1
+
+      if ($bigDisk) {
+        Write-Host "Detected disk: Number=$($bigDisk.Number) Model=$($bigDisk.FriendlyName) SizeBytes=$($bigDisk.Size)"
+      } else {
+        $errors += "No physical disk >= 512 GB detected. Available disks:"
+        Get-Disk -ErrorAction SilentlyContinue | ForEach-Object {
+          Write-Host "Disk Number=$($_.Number) Model=$($_.FriendlyName) SizeBytes=$($_.Size)"
+        }
+      }
+
+      if ($errors.Count -gt 0) {
+        Write-Error ($errors -join "`n")
+        exit 1
+      } else {
+        Write-Host "Hardware verification passed: GPU and disk match expectations."
+        Add-Content -Path $env:GITHUB_ENV -Value "HW_VERIFIED=true"
+      }
+
+  - name: Establish Tailscale Connection
+    shell: pwsh
+    env:
+      TAILSCALE_AUTH_KEY: ${{ secrets.TAILSCALE_AUTH_KEY }}
+    run: |
+      $tsExe = Join-Path $env:ProgramFiles 'Tailscale\tailscale.exe'
+      if (-not (Test-Path $tsExe)) {
+        Write-Error "tailscale.exe not found at $tsExe"
+        exit 1
+      }
+
+      & $tsExe up --authkey="$env:TAILSCALE_AUTH_KEY" --hostname="gh-runner-$env:GITHUB_RUN_ID"
+
+      # Wait for IPv4 to be assigned
+      $tsIP = $null
+      $retries = 0
+      while (-not $tsIP -and $retries -lt 12) {
+        $tsIP = (& $tsExe ip -4).Trim()
+        Start-Sleep -Seconds 5
+        $retries++
+      }
+
+      if (-not $tsIP) {
+        Write-Error "Tailscale IP not assigned. Exiting."
+        exit 1
+      }
+
+      Add-Content -Path $env:GITHUB_ENV -Value "TAILSCALE_IP=$tsIP"
+      Write-Host "Assigned Tailscale IP: $tsIP"
+
+  - name: Verify RDP Accessibility
+    shell: pwsh
+    run: |
+      Write-Host "Tailscale IP: $env:TAILSCALE_IP"
+
+      $testResult = Test-NetConnection -ComputerName $env:TAILSCALE_IP -Port 3389 -WarningAction SilentlyContinue
+      if (-not $testResult.TcpTestSucceeded) {
+        Write-Error "TCP connection to RDP port 3389 failed"
+        exit 1
+      }
+      Write-Host "TCP connectivity successful!"
+
+  - name: Maintain Connection (keep runner alive)
+    shell: pwsh
+    run: |
+      Write-Host "`n=== RDP ACCESS ==="
+      Write-Host "Tailscale IP: $env:TAILSCALE_IP"
+      Write-Host "Credentials uploaded as artifact: rdp-creds-${{ github.run_id }}"
+      Write-Host "Username: Skyro (password in artifact)"
+      Write-Host "==================`n"
+
+      while ($true) {
+        Write-Host "[$(Get-Date)] RDP Active - Use Ctrl+C in workflow to terminate"
+        Start-Sleep -Seconds 300
+      }
